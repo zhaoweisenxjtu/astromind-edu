@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
-"""astromind-edu v0.1 — SQLite 存储工具（唯一代码层）.
+"""astromind-edu v0.3 — SQLite 存储工具（唯一代码层）.
 
-agent 通过 Bash 调用，全部命令 JSON 输出。只做持久化，不做教学编排——
+agent 通过 Bash 调用。只做持久化，不做教学编排——
 教学法在 SKILL.md，LLM 是 agent 自身。
 
+输出契约：默认全部命令 JSON 输出。显式例外（stdout 直出非 JSON 文本，
+供人直接阅读/粘贴）：
+  - graph --format mermaid          （Mermaid 知识图谱）
+  - cheat-sheet                     （Markdown 速查表）
+  - status --format visual          （ASCII 条形图）
+  - evidence last --format compact  （单行紧凑摘要）
+
 用法:
-  python db.py status [--topic X]
+  python db.py status [--topic X] [--format json|visual]
   python db.py next-review [--topic X] [--limit N]
-  python db.py concept add|get|list|update|search ...
+  python db.py concept add|get|list|update|search ... [--depth aware|understand|apply]
   python db.py edge add|list --topic X ...
-  python db.py graph --topic X
+  python db.py graph --topic X [--format json|mermaid]
+  python db.py cheat-sheet --topic X [--detail full|compact|auto] [--max-items N]
   python db.py evidence log|log-batch|last ...
   python db.py misconception add|list ...
 
 DB: ~/.astromind-edu/edu.db（ASTROMIND_EDU_DB_PATH 覆盖，测试隔离用）
+visuals: ~/.astromind-edu/visuals/<concept_id>.html（交互动画约定路径，db.py 不管理）
 """
 
 import argparse
@@ -42,6 +51,8 @@ CREATE TABLE IF NOT EXISTS concepts (
     tags        TEXT NOT NULL DEFAULT '[]',
     status      TEXT NOT NULL DEFAULT 'learning'
                 CHECK (status IN ('learning', 'mastered', 'reviewing', 'archived')),
+    depth       TEXT NOT NULL DEFAULT 'apply'
+                CHECK (depth IN ('aware', 'understand', 'apply')),
     level       INTEGER NOT NULL DEFAULT 1 CHECK (level BETWEEN 1 AND 5),
     ef          REAL NOT NULL DEFAULT 2.5 CHECK (ef >= 1.3),
     interval_d  INTEGER NOT NULL DEFAULT 0 CHECK (interval_d >= 0),
@@ -116,6 +127,13 @@ def init_db() -> None:
     conn = get_conn()
     try:
         conn.executescript(SCHEMA)
+        # v0.3 迁移：旧库补 depth 列（默认 apply = v0.1 行为，存量概念不受影响）
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(concepts)").fetchall()]
+        if "depth" not in cols:
+            conn.execute(
+                "ALTER TABLE concepts ADD COLUMN depth TEXT NOT NULL DEFAULT 'apply' "
+                "CHECK (depth IN ('aware', 'understand', 'apply'))"
+            )
         conn.commit()
     finally:
         conn.close()
@@ -166,13 +184,37 @@ def cmd_status(args) -> None:
                 "AND status!='archived'", (t,),
             ).fetchone()["c"]
             due_total += due
+            depth_rows = conn.execute(
+                "SELECT depth, COUNT(*) AS c FROM concepts WHERE topic=? GROUP BY depth",
+                (t,),
+            ).fetchall()
+            by_depth = {d: 0 for d in ("aware", "understand", "apply")}
+            for dr in depth_rows:
+                if dr["depth"] in by_depth:
+                    by_depth[dr["depth"]] = dr["c"]
             topics.append({
                 "topic": t,
                 "total": r["total"],
                 "mastered": r["mastered"],
                 "reviewing": r["reviewing"],
                 "due_today": due,
+                "by_depth": by_depth,
             })
+
+        if args.format == "visual":
+            icons = {"mastered": "✅", "learning": "📖", "reviewing": "🟡"}
+            for t in topics:
+                learning = t["total"] - t["mastered"] - t["reviewing"]
+                bd = t["by_depth"]
+                print(f"主题: {t['topic']} ({t['total']} 概念)   "
+                      f"[深度 apply {bd['apply']} | understand {bd['understand']} "
+                      f"| aware {bd['aware']}]")
+                print(f"{icons['mastered']} mastered:   {'█' * t['mastered']} {t['mastered']}")
+                print(f"{icons['learning']} learning:   {'█' * learning} {learning}")
+                print(f"{icons['reviewing']} reviewing:  {'█' * t['reviewing']} {t['reviewing']}")
+                print(f"🔴 今日到期:   {'█' * t['due_today']} {t['due_today']}")
+                print()
+            return
 
         # 无任何记录时的全新开始
         if not topics:
@@ -225,8 +267,9 @@ def cmd_concept_add(args) -> None:
         sources = json.dumps(args.sources or [], ensure_ascii=False)
         tags = json.dumps(args.tags or [], ensure_ascii=False)
         cur = conn.execute(
-            "INSERT INTO concepts (topic, name, content, sources, tags) VALUES (?,?,?,?,?)",
-            (args.topic, args.name, args.content or "", sources, tags),
+            "INSERT INTO concepts (topic, name, content, sources, tags, depth) "
+            "VALUES (?,?,?,?,?,?)",
+            (args.topic, args.name, args.content or "", sources, tags, args.depth),
         )
         conn.commit()
         emit({"id": cur.lastrowid, "created": True})
@@ -259,6 +302,9 @@ def cmd_concept_list(args) -> None:
         if args.status:
             q += " AND status = ?"
             params.append(args.status)
+        if getattr(args, "depth", None):
+            q += " AND depth = ?"
+            params.append(args.depth)
         q += " ORDER BY level DESC, created_at"
         rows = conn.execute(q, params).fetchall()
         emit([dict(r) for r in rows])
@@ -268,7 +314,7 @@ def cmd_concept_list(args) -> None:
 
 def cmd_concept_update(args) -> None:
     allowed = {"content", "sources", "status", "level", "ef", "interval_d",
-               "reps", "next_review"}
+               "reps", "next_review", "depth"}
     updates = {k: v for k, v in vars(args).items()
                if k in allowed and v is not None}
     if not updates:
@@ -335,15 +381,22 @@ def cmd_edge_list(args) -> None:
         conn.close()
 
 
+def _mermaid_escape(s: str) -> str:
+    """Mermaid 节点标签转义：双引号会破坏 A["..."] 语法。"""
+    return (s or "").replace('"', "'")
+
+
 def cmd_graph(args) -> None:
     conn = get_conn()
     try:
         nodes = conn.execute(
-            "SELECT id, name, status, level, next_review FROM concepts WHERE topic=?",
+            "SELECT id, name, status, level, depth, next_review FROM concepts "
+            "WHERE topic=?",
             (args.topic,),
         ).fetchall()
         rows = conn.execute(
-            "SELECT e.relation, s.name AS src, d.name AS dst "
+            "SELECT e.relation, s.id AS src_id, d.id AS dst_id, "
+            "s.name AS src, d.name AS dst "
             "FROM edges e JOIN concepts s ON e.src_id=s.id "
             "JOIN concepts d ON e.dst_id=d.id WHERE e.topic=?",
             (args.topic,),
@@ -359,11 +412,168 @@ def cmd_graph(args) -> None:
             d = dict(n)
             d["unresolved_misconceptions"] = mc
             node_list.append(d)
+
+        # need_visual 确定性信号（F1）：非 aware 概念 ≥3 或关联关系 ≥2
+        core = [n for n in node_list if n["depth"] != "aware"]
+        need_visual = len(core) >= 3 or len(rows) >= 2
+
+        if args.format == "mermaid":
+            today = date.today().isoformat()
+            lines = ["graph TD"]
+            for n in node_list:
+                lines.append(f'    n{n["id"]}["{_mermaid_escape(n["name"])}"]')
+            for r in rows:
+                arrow = "---" if r["relation"] == "related" else "-->"
+                lines.append(
+                    f'    n{r["src_id"]} {arrow}|{r["relation"]}| n{r["dst_id"]}'
+                )
+            groups: dict = {}
+            for n in node_list:
+                cls = []
+                if n["status"] in ("mastered", "reviewing"):
+                    cls.append(n["status"])
+                if n["next_review"] and str(n["next_review"]) <= today:
+                    cls.append("due")
+                if n["unresolved_misconceptions"] > 0:
+                    cls.append("misconception")
+                if n["depth"] == "aware":
+                    cls.append("aware")
+                if cls:
+                    groups.setdefault(",".join(cls), []).append(f'n{n["id"]}')
+            lines.append("    classDef mastered fill:#d4edda,stroke:#28a745")
+            lines.append("    classDef reviewing fill:#fff3cd,stroke:#ffc107")
+            lines.append("    classDef due fill:#f8d7da,stroke:#dc3545")
+            lines.append(
+                "    classDef misconception stroke:#dc3545,stroke-width:2px")
+            lines.append(
+                "    classDef aware fill:#f5f5f5,stroke:#999999,"
+                "stroke-dasharray:4 3")
+            for cls, ids in groups.items():
+                lines.append(f'    class {",".join(ids)} {cls}')
+            print(f"--- {args.topic} 知识图谱 (Mermaid) ---")
+            print("```mermaid")
+            print("\n".join(lines))
+            print("```")
+            return
+
         emit({"nodes": node_list,
               "edges": [{"src": r["src"], "dst": r["dst"],
-                         "relation": r["relation"]} for r in rows]})
+                         "relation": r["relation"]} for r in rows],
+              "need_visual": need_visual})
     finally:
         conn.close()
+
+
+# ── Cheat Sheet（F4）──
+
+def _topo_order(rows, prereq_pairs):
+    """Kahn 拓扑排序（仅 prerequisite 边计入度）。返回 (names, has_cycle)。
+
+    同层排序键：(level 升序, created_at, name)。检测到环时整体降级为
+    level 排序并返回 has_cycle=True。
+    """
+    name_set = {r["name"] for r in rows}
+    in_deg = {r["name"]: 0 for r in rows}
+    adj: dict = {r["name"]: [] for r in rows}
+    for src, dst in prereq_pairs:
+        if src in name_set and dst in name_set and src != dst:
+            adj[src].append(dst)
+            in_deg[dst] += 1
+    by_key = {r["name"]: (r["level"], r["created_at"], r["name"]) for r in rows}
+    ready = sorted([n for n in in_deg if in_deg[n] == 0], key=lambda n: by_key[n])
+    order = []
+    while ready:
+        n = ready.pop(0)
+        order.append(n)
+        for m in adj[n]:
+            in_deg[m] -= 1
+            if in_deg[m] == 0:
+                ready.append(m)
+        ready.sort(key=lambda x: by_key[x])
+    if len(order) < len(rows):
+        order = [r["name"] for r in
+                 sorted(rows, key=lambda r: (r["level"], r["created_at"]))]
+        return order, True
+    return order, False
+
+
+def cmd_cheat_sheet(args) -> None:
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM concepts WHERE topic=? AND status!='archived'",
+            (args.topic,),
+        ).fetchall()
+        if not rows:
+            err(f"no concepts for topic: {args.topic}")
+        pair_rows = conn.execute(
+            "SELECT s.name AS src, d.name AS dst FROM edges e "
+            "JOIN concepts s ON e.src_id=s.id JOIN concepts d ON e.dst_id=d.id "
+            "WHERE e.topic=? AND e.relation='prerequisite'",
+            (args.topic,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    pairs = [(r["src"], r["dst"]) for r in pair_rows]
+    order, has_cycle = _topo_order(rows, pairs)
+    if has_cycle:
+        order = [r["name"] for r in
+                 sorted(rows, key=lambda r: (r["level"], r["created_at"]))]
+    by_name = {r["name"]: r for r in rows}
+    if args.max_items and len(order) > args.max_items:
+        order = order[: args.max_items]
+
+    detail = args.detail or "auto"
+    icons = {"mastered": "✅", "learning": "📖", "reviewing": "🟡"}
+    depth_cn = {"aware": "了解", "understand": "理解", "apply": "掌握运用"}
+    main_names = [n for n in order if by_name[n]["depth"] != "aware"]
+    quick_names = [n for n in order if by_name[n]["depth"] == "aware"]
+
+    lines = [f"# {args.topic} Cheat Sheet", ""]
+    meta = f"> 生成时间: {date.today().isoformat()} | 共 {len(order)} 个概念"
+    if has_cycle:
+        meta += " | ⚠️ 检测到依赖环，已降级为按层级排序"
+    lines += [meta, ""]
+
+    lines.append("## 核心概念（按依赖顺序）")
+    lines.append("")
+    for i, name in enumerate(main_names, 1):
+        r = by_name[name]
+        lines.append(f"### {i}. {name}")
+        lines.append(
+            f"- **状态**: {icons.get(r['status'], r['status'])} {r['status']} "
+            f"| **等级**: L{r['level']} "
+            f"| **深度**: {depth_cn.get(r['depth'], r['depth'])}"
+        )
+        content = (r["content"] or "").strip()
+        body_lines = content.splitlines() if content else []
+        first_line = body_lines[0].strip() if body_lines else "（待补充）"
+        lines.append(f"- **定义**: {first_line}")
+        # auto：mastered 只给 1-2 行提词；compact：全部提词；full：全部详解
+        brief = detail == "compact" or (detail == "auto" and r["status"] == "mastered")
+        if not brief and len(body_lines) > 1:
+            lines.append("- **要点**:")
+            for bl in body_lines[1:]:
+                if bl.strip():
+                    lines.append(f"  - {bl.strip()}")
+        downs = [dst for src, dst in pairs if src == name and dst in by_name]
+        if downs:
+            lines.append(f"- **关联**: 前置 → {'、'.join(downs)}")
+        lines.append(f"- **下次复习**: {r['next_review'] or '—'}")
+        lines.append("")
+
+    if quick_names:
+        lines.append("## 速览区（了解级，再认即可）")
+        lines.append("")
+        for name in quick_names:
+            r = by_name[name]
+            c = (r["content"] or "").strip().splitlines()
+            one = c[0].strip() if c else ""
+            icon = icons.get(r["status"], "")
+            lines.append(f"- **{name}** {icon} — {one}")
+
+    print("\n".join(lines))
 
 
 # ── 证据与复习 ──
@@ -461,6 +671,22 @@ def cmd_evidence_last(args) -> None:
             "ORDER BY id DESC LIMIT ?",
             (args.concept, args.topic, args.limit or 5),
         ).fetchall()
+        if args.format == "compact":
+            icons = {"success": "✅", "partial": "🟡",
+                     "failure": "❌", "warm_start": "🔵"}
+            for r in rows:
+                d = (r["created_at"] or "")[5:10]
+                extra = ""
+                if r["kind"] == "teachback" and r["teachback_score"]:
+                    extra += f" score:{r['teachback_score']}/5"
+                if r["error_type"]:
+                    extra += f" error:{r['error_type']}"
+                if r["hint_level"]:
+                    extra += f" hint:{r['hint_level']}"
+                det = (r["detail"] or "").strip()[:40]
+                print(f'[{d}] {r["kind"]:<10} {icons.get(r["outcome"], "")} '
+                      f'{r["outcome"]:<8}-{extra} {det}')
+            return
         emit([dict(r) for r in rows])
     finally:
         conn.close()
@@ -519,6 +745,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("status")
     sp.add_argument("--topic")
+    sp.add_argument("--format", choices=["json", "visual"], default="json")
     sp.set_defaults(func=cmd_status)
 
     sp = sub.add_parser("next-review")
@@ -534,6 +761,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--content")
     a.add_argument("--sources", type=json.loads)
     a.add_argument("--tags", type=json.loads)
+    a.add_argument("--depth", choices=["aware", "understand", "apply"],
+                   default="apply")
     a.set_defaults(func=cmd_concept_add)
     g = csub.add_parser("get")
     g.add_argument("--topic", required=True)
@@ -543,12 +772,14 @@ def build_parser() -> argparse.ArgumentParser:
     l = csub.add_parser("list")
     l.add_argument("--topic")
     l.add_argument("--status")
+    l.add_argument("--depth", choices=["aware", "understand", "apply"])
     l.set_defaults(func=cmd_concept_list)
     u = csub.add_parser("update")
     u.add_argument("--id", type=int, required=True)
     u.add_argument("--content")
     u.add_argument("--sources", type=json.loads)
     u.add_argument("--status")
+    u.add_argument("--depth", choices=["aware", "understand", "apply"])
     u.add_argument("--level", type=int)
     u.add_argument("--ef", type=float)
     u.add_argument("--interval-d", dest="interval_d", type=int)
@@ -573,7 +804,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("graph")
     sp.add_argument("--topic", required=True)
+    sp.add_argument("--format", choices=["json", "mermaid"], default="json")
     sp.set_defaults(func=cmd_graph)
+
+    sp = sub.add_parser("cheat-sheet")
+    sp.add_argument("--topic", required=True)
+    sp.add_argument("--detail", choices=["full", "compact", "auto"],
+                    default="auto")
+    sp.add_argument("--max-items", dest="max_items", type=int, default=50)
+    sp.set_defaults(func=cmd_cheat_sheet)
 
     sp = sub.add_parser("evidence")
     esub = sp.add_subparsers(dest="sub")
@@ -602,6 +841,7 @@ def build_parser() -> argparse.ArgumentParser:
     la.add_argument("--topic", required=True)
     la.add_argument("--concept", required=True)
     la.add_argument("--limit", type=int)
+    la.add_argument("--format", choices=["json", "compact"], default="json")
     la.set_defaults(func=cmd_evidence_last)
 
     sp = sub.add_parser("misconception")
@@ -621,6 +861,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    # Windows GBK 控制台兼容：emoji/中文输出统一走 UTF-8，避免 UnicodeEncodeError
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     parser = build_parser()
     args = parser.parse_args()
     if not getattr(args, "func", None):
