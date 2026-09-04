@@ -35,11 +35,11 @@ from pathlib import Path
 
 from sm2 import SM2Calculator
 
-DB_DIR = Path.home() / ".astromind-edu"
-DB_PATH = Path(os.environ.get("ASTROMIND_EDU_DB_PATH", str(DB_DIR / "edu.db")))
+SKILL_DIR = Path(__file__).resolve().parent
+DB_PATH = Path(os.environ.get("ASTROMIND_EDU_DB_PATH", str(SKILL_DIR / "edu.db")))
 
 SCHEMA = """
-PRAGMA journal_mode = WAL;
+PRAGMA journal_mode = DELETE;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS concepts (
@@ -115,10 +115,10 @@ CREATE INDEX IF NOT EXISTS idx_mc_topic ON misconceptions(topic, concept);
 # ── 连接与初始化 ──
 
 def get_conn() -> sqlite3.Connection:
-    DB_DIR.mkdir(parents=True, exist_ok=True)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA journal_mode=DELETE;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 

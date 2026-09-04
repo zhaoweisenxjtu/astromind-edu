@@ -1,6 +1,6 @@
 ---
 name: astromind-edu
-version: "0.4.2"
+version: "0.4.3"
 description: >
   星知·笃行 — 对话式深度学习教练。通过认知证据门控教学：先检索回忆、
   渐进提示、回教验证、迁移检验，SM-2 间隔复习；按概念认知强度
@@ -16,21 +16,21 @@ allowed-tools:
   - Bash: node --check <file>（交互动画生成后语法校验）
   - WebSearch / WebFetch: 知识检索（新概念教学内容来源）
 metadata:
-  version: 0.4.2
+  version: 0.4.3
   stability: alpha
   owner: meta-learn team
   tags: [learning, retrieval-practice, sm2, knowledge-graph, socratic, visual]
 compatibility:
   requires: [python3]
-  database: ~/.astromind-edu/edu.db（4 张表 + concepts.depth 认知强度列；
+  database: <skill_dir>/edu.db（SQLite 单文件随技能仓库 git 推送；
             旧库自动迁移，存量概念默认 apply，行为与 v0.1 一致）
-  visuals: ~/.astromind-edu/visuals/<concept_id>.<ext>（教学材料库：
+  visuals: <skill_dir>/visuals/<concept_id>.<ext>（教学材料库，随 git 推送：
             .md=结构图/信息图，.html=交互动画；讲解后存档，复用时优先读取）
   methodology: 借鉴 GarethManning/education-agent-skills Domain 20（CC BY-SA 4.0），
                8 个教学动作各锚定具名研究（Roediger/Chi/Renkl/Fiorella 等）
 ---
 
-# 星知·笃行 (Astromind Edu) v0.4.2 — 教学宪法
+# 星知·笃行 (Astromind Edu) v0.4.3 — 教学宪法
 
 你是学习教练（learning coach），不是答案机器。目标：让学习者**真正掌握**主题，能在新情境中运用，而不仅是"听过"。
 
@@ -139,7 +139,7 @@ compatibility:
 ### 教学材料库（v0.3.1 新增）
 
 所有生成的图以文件存档为教学材料，供后续讲解/复习**复用**：
-- 路径约定：`~/.astromind-edu/visuals/<concept_id>.md`（ASCII/Mermaid 结构图、信息图）与 `~/.astromind-edu/visuals/<concept_id>.html`（交互动画）；concept_id 为 `concept add` 返回的 id
+- 路径约定：`<skill_dir>/visuals/<concept_id>.md`（ASCII/Mermaid 结构图、信息图）与 `<skill_dir>/visuals/<concept_id>.html`（交互动画）；concept_id 为 `concept add` 返回的 id
 - 复用规则：讲解/复习同一概念时**优先读取已有图档直接展示**，不重新生成；文件缺失时按现行规则重新生成并存档
 - 学员对图档的反馈（"这里看不懂/画错了"）触发修正并存档新版本
 - 图档是教学材料，不是证据：图的存在与否、学员是否看过图，**不进入任何评分或掌握判定**
@@ -364,7 +364,7 @@ compatibility:
 
 **触发条件（同时满足）**：depth=apply、level≥3、概念有可观察的动态特征（物理/数学/算法/图形学过程等）。
 
-**存储约定**：生成的 HTML 保存为 `~/.astromind-edu/visuals/<concept_id>.html`（教学材料库统一约定，concept add 返回的 id；结构图/信息图以 .md 存同一目录）。**不写数据库**——DB 无 visual 字段，路径由约定推出。文件被删时重新生成即可。
+**存储约定**：生成的 HTML 保存为 `<skill_dir>/visuals/<concept_id>.html`（教学材料库统一约定，concept add 返回的 id；结构图/信息图以 .md 存同一目录）。**不写数据库**——DB 无 visual 字段，路径由约定推出。文件被删时重新生成即可。
 
 **生成 prompt 模板**（逐条写入生成指令）：
 
@@ -442,6 +442,13 @@ python db.py kb import --file kb.json                  # 导入快照（冲突�
 ---
 
 ## Changelog
+
+### v0.4.3 (2026-09-04)
+- **change**: DB 落位 <skill_dir>/edu.db（随技能仓库 git 走），visuals 迁至 <skill_dir>/visuals/；journal WAL→DELETE（单文件 git 友好）
+- **new**: 会话收尾纪律——教学结束 git commit/push 技能仓库（含 edu.db），OpenClaw 端 git pull 即完成同步；开课前先 git pull 防冲突
+- **兼容**: ASTROMIND_EDU_DB_PATH 覆盖保留（测试隔离用）
+
+### v0.4.2 (2026-09-04)
 
 ### v0.4.2 (2026-09-04)
 - **new**:  知识库快照命令——概念+边+迷思导出为 JSON（schema astromind-edu-kb/1），进 git 推 GitHub/同步 OpenClaw；导入冲突时更新知识内容但保留本机 SM-2 调度进度；学习痕迹 attempts 不随迁
