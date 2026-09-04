@@ -619,7 +619,7 @@ def cmd_evidence_log(args) -> None:
 
 
 def cmd_evidence_log_batch(args) -> None:
-    path = Path(args.file)
+    path = _win_path(args.file)
     if not path.exists():
         err(f"file not found: {args.file}")
     try:
@@ -732,6 +732,150 @@ def cmd_misconception_list(args) -> None:
         q += " ORDER BY hit_count DESC, created_at"
         rows = conn.execute(q, params).fetchall()
         emit([dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+# ── 知识库快照（kb export / kb import，v0.4.2）──
+# 用途：把知识图谱（概念+边+迷思）导出为可进 git 的 JSON 快照，
+#       推送 GitHub / 同步到 OpenClaw 等远端后再导入。
+# 设计约定：导出/导入只含「知识层」，不含 SM-2 调度参数（ef/interval_d/reps/
+# next_review）与学习痕迹 attempts——那些是本机个人进度，跨端同步以快照为准。
+
+KB_SCHEMA = "astromind-edu-kb/1"
+
+
+def _win_path(p: str) -> Path:
+    """归一化路径：兼容 Git Bash 风格 /d/foo → D:\\foo（Windows 下 agent 常传入）。"""
+    import re
+    m = re.match(r"^/([a-zA-Z])/(.*)$", p)
+    if m:
+        return Path(f"{m.group(1).upper()}:/{m.group(2)}")
+    return Path(os.path.expanduser(p))
+
+
+def cmd_kb_export(args) -> None:
+    conn = get_conn()
+    try:
+        q = ("SELECT topic, name, content, sources, tags, status, depth, level "
+             "FROM concepts WHERE 1=1")
+        params = []
+        if args.topic:
+            q += " AND topic = ?"
+            params.append(args.topic)
+        q += " ORDER BY topic, level, created_at"
+        concepts = [dict(r) for r in conn.execute(q, params).fetchall()]
+
+        eq = ("SELECT e.topic AS _topic, c1.name AS src, c2.name AS dst, "
+              "e.relation FROM edges e "
+              "JOIN concepts c1 ON c1.id = e.src_id "
+              "JOIN concepts c2 ON c2.id = e.dst_id WHERE 1=1")
+        eq_params = []
+        if args.topic:
+            eq += " AND e.topic = ?"
+            eq_params = [args.topic]
+        edges = [dict(r) for r in conn.execute(eq, eq_params).fetchall()]
+
+        mq = ("SELECT topic, concept, belief, correction, resolved "
+              "FROM misconceptions WHERE 1=1")
+        mq_params = []
+        if args.topic:
+            mq += " AND topic = ?"
+            mq_params = [args.topic]
+        misconceptions = [dict(r) for r in conn.execute(mq, mq_params).fetchall()]
+
+        topics = sorted({c["topic"] for c in concepts})
+        snapshot = {
+            "schema": KB_SCHEMA,
+            "exported_at": datetime.now().isoformat(timespec="seconds"),
+            "topics": topics,
+            "concepts": concepts,
+            "edges": edges,
+            "misconceptions": misconceptions,
+        }
+        text = json.dumps(snapshot, ensure_ascii=False, indent=2)
+        if args.file:
+            _win_path(args.file).write_text(text, encoding="utf-8")
+            emit({"exported": True, "file": args.file, "concepts": len(concepts),
+                  "edges": len(edges), "misconceptions": len(misconceptions),
+                  "topics": topics})
+        else:
+            print(text)
+    finally:
+        conn.close()
+
+
+def cmd_kb_import(args) -> None:
+    path = _win_path(args.file)
+    if not path.exists():
+        err(f"file not found: {path}")
+    try:
+        snap = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        err(f"invalid json: {e}")
+    if snap.get("schema") != KB_SCHEMA:
+        err(f"unsupported schema: {snap.get('schema')!r} (expect {KB_SCHEMA!r})")
+
+    conn = get_conn()
+    try:
+        added, updated = 0, 0
+        for c in snap.get("concepts", []):
+            cur = conn.execute(
+                "INSERT INTO concepts (topic, name, content, sources, tags, "
+                "status, depth, level) VALUES (?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(topic, name) DO UPDATE SET "
+                "content=excluded.content, sources=excluded.sources, "
+                "tags=excluded.tags, status=excluded.status, "
+                "depth=excluded.depth, level=excluded.level, "
+                "updated_at=datetime('now')",
+                (c["topic"], c["name"], c.get("content", ""),
+                 c.get("sources", "[]"), c.get("tags", "[]"),
+                 c.get("status", "learning"), c.get("depth", "apply"),
+                 c.get("level", 1)),
+            )
+            # lastrowid 为新插入；rowcount==0/2 视为冲突更新（SM-2 进度保留）
+            if cur.lastrowid and cur.lastrowid > 0 and cur.rowcount == 1:
+                added += 1
+            else:
+                updated += 1
+        # 快照不含 SM-2 参数：冲突时保留本机调度进度（DO UPDATE 未触碰这些列）
+
+        name2id = {}
+        for r in conn.execute("SELECT id, topic, name FROM concepts"):
+            name2id[(r["topic"], r["name"])] = r["id"]
+        e_added = 0
+        for e in snap.get("edges", []):
+            topic = e.get("_topic") or (snap["topics"][0] if snap.get("topics") else "")
+            src = name2id.get((topic, e["src"]))
+            dst = name2id.get((topic, e["dst"]))
+            if src is None:
+                cands = [v for (t, n), v in name2id.items() if n == e["src"]]
+                src = cands[0] if len(cands) == 1 else None
+            if dst is None:
+                cands = [v for (t, n), v in name2id.items() if n == e["dst"]]
+                dst = cands[0] if len(cands) == 1 else None
+            if src is None or dst is None:
+                continue
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO edges (topic, src_id, dst_id, relation) "
+                "VALUES (?,?,?,?)",
+                (topic, src, dst, e.get("relation", "prerequisite")),
+            )
+            e_added += cur.rowcount
+
+        mc_added = 0
+        for m in snap.get("misconceptions", []):
+            conn.execute(
+                "INSERT INTO misconceptions (topic, concept, belief, correction, "
+                "resolved) VALUES (?,?,?,?,?)",
+                (m["topic"], m["concept"], m["belief"],
+                 m.get("correction", ""), int(m.get("resolved", 0))),
+            )
+            mc_added += 1
+        conn.commit()
+        emit({"imported": True, "file": args.file,
+              "concepts_added": added, "concepts_updated": updated,
+              "edges_added": e_added, "misconceptions_added": mc_added})
     finally:
         conn.close()
 
@@ -856,6 +1000,16 @@ def build_parser() -> argparse.ArgumentParser:
     l.add_argument("--topic")
     l.add_argument("--unresolved-only", dest="unresolved_only", action="store_true")
     l.set_defaults(func=cmd_misconception_list)
+
+    sp = sub.add_parser("kb", help="知识库快照导出/导入（跨端同步）")
+    ksub = sp.add_subparsers(dest="sub")
+    e = ksub.add_parser("export")
+    e.add_argument("--topic", help="只导出指定主题（缺省全部）")
+    e.add_argument("--file", help="输出 JSON 文件路径（缺省 stdout）")
+    e.set_defaults(func=cmd_kb_export)
+    i = ksub.add_parser("import")
+    i.add_argument("--file", required=True, help="快照 JSON 文件路径")
+    i.set_defaults(func=cmd_kb_import)
 
     return p
 

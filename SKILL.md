@@ -1,6 +1,6 @@
 ---
 name: astromind-edu
-version: "0.4.1"
+version: "0.4.2"
 description: >
   星知·笃行 — 对话式深度学习教练。通过认知证据门控教学：先检索回忆、
   渐进提示、回教验证、迁移检验，SM-2 间隔复习；按概念认知强度
@@ -16,7 +16,7 @@ allowed-tools:
   - Bash: node --check <file>（交互动画生成后语法校验）
   - WebSearch / WebFetch: 知识检索（新概念教学内容来源）
 metadata:
-  version: 0.4.1
+  version: 0.4.2
   stability: alpha
   owner: meta-learn team
   tags: [learning, retrieval-practice, sm2, knowledge-graph, socratic, visual]
@@ -30,7 +30,7 @@ compatibility:
                8 个教学动作各锚定具名研究（Roediger/Chi/Renkl/Fiorella 等）
 ---
 
-# 星知·笃行 (Astromind Edu) v0.4.1 — 教学宪法
+# 星知·笃行 (Astromind Edu) v0.4.2 — 教学宪法
 
 你是学习教练（learning coach），不是答案机器。目标：让学习者**真正掌握**主题，能在新情境中运用，而不仅是"听过"。
 
@@ -420,6 +420,10 @@ python db.py evidence last --topic X --concept Y [--format json|compact]
 # 迷思
 python db.py misconception add --topic X --concept Y --belief "..." [--correction "..."]
 python db.py misconception list [--topic X] [--unresolved-only]
+
+# 知识库快照（跨端同步：GitHub / OpenClaw）
+python db.py kb export [--topic X] [--file kb.json]   # 知识层快照（概念+边+迷思；不含 SM-2 进度）
+python db.py kb import --file kb.json                  # 导入快照（冲突更新知识内容，保留本机 SM-2 进度）
 ```
 
 ---
@@ -438,6 +442,11 @@ python db.py misconception list [--topic X] [--unresolved-only]
 ---
 
 ## Changelog
+
+### v0.4.2 (2026-09-04)
+- **new**:  知识库快照命令——概念+边+迷思导出为 JSON（schema astromind-edu-kb/1），进 git 推 GitHub/同步 OpenClaw；导入冲突时更新知识内容但保留本机 SM-2 调度进度；学习痕迹 attempts 不随迁
+- **fix**: kb 文件路径归一化（兼容 Git Bash 风格 /d/... 路径）；evidence log-batch 同步受益
+- **兼容**: 纯新增命令，DB schema 零改动
 
 ### v0.4.1 (2026-09-04)
 - **change**: 数理类教材主线泛化——不再预设线代/概率书目，改为三优先级：学员指定教材/课程 → agent WebSearch 检索经典教材/公开课并报告依据 → 检索不可用时按学科通识并标注"未经检索验证"；主线中途可换，进度不重置
